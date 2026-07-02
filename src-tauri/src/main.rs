@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use candle_core::Device;
 use serde::Serialize;
-use tauri::State;
+use tauri::{Manager, State};
 use tokenizers::Tokenizer;
 
 mod model_wrapper;
@@ -42,10 +42,10 @@ fn model_dir() -> PathBuf {
 fn build_prompt(code: &str) -> String {
     let system = "You are a senior code reviewer. Analyze the user code and find bugs, \
         logic errors, and bad practices. Reply ONLY with valid JSON, no markdown. \
-        Format: {\"errors\":[{\"line\":N,\"type\":\"TYPE\",\"description\":\"DESC\",\"fix\":\"FIX\"}]} \
-        If no errors: {\"errors\":[]} \
+        Format: {\\\"errors\\\":[{\\\"line\\\":N,\\\"type\\\":\\\"TYPE\\\",\\\"description\\\":\\\"DESC\\\",\\\"fix\\\":\\\"FIX\\\"}]} \
+        If no errors: {\\\"errors\\\":[]} \
         Possible types: logic_error, runtime_error, bad_practice, security, performance, type_error. \
-        Keep descriptions short. Keep fixes as corrected code snippets."
+        Keep descriptions short. Keep fixes as corrected code snippets.";
     format!(
         "<|im_start|>system\n{}\n<|im_start|>user\n{}\n<|im_start|>assistant\n",
         system, code
@@ -120,11 +120,11 @@ fn analyze_code(code: String, state: State<AppState>) -> AnalysisResponse {
     }
     drop(load_err);
 
-    let model_lock = state.model.lock().unwrap();
+    let mut model_lock = state.model.lock().unwrap();
     let tokenizer_lock = state.tokenizer.lock().unwrap();
 
-    let model = match model_lock.as_ref() {
-        Some(m) => m.as_ref(),
+    let model = match model_lock.as_mut() {
+        Some(m) => m.as_mut(),
         None => return AnalysisResponse { ok: false, errors: None, error: Some("Model not loaded".into()) },
     };
     let tokenizer = match tokenizer_lock.as_ref() {
@@ -141,31 +141,41 @@ fn analyze_code(code: String, state: State<AppState>) -> AnalysisResponse {
     let max_new_tokens: usize = 1024;
     let mut generated = tokens.clone();
 
-    let gen_result = (0..max_new_tokens).try_for_each(|_| {
+    let mut gen_error: Option<candle_core::Error> = None;
+    for _ in 0..max_new_tokens {
         let input_len = generated.len();
-        let ctx_size = std::cmp::min(input_len, model.context_size());
-        let start = input_len.saturating_sub(ctx_size);
+        let start = input_len.saturating_sub(2048);
         let input_tokens = &generated[start..];
 
-        let logits = model.forward(input_tokens, 0)?;
-        let seq_len = logits.dim(0)?;
-        let last = logits.get(seq_len - 1)?;
-        let next_token_logits = last.get(last.dim(0)? - 1)?;
+        let logits = match model.forward(input_tokens, 0) {
+            Ok(l) => l,
+            Err(e) => { gen_error = Some(e); break; }
+        };
+        let next_token_logits = match logits
+            .get(logits.dim(0).unwrap_or(0) - 1)
+            .and_then(|last| last.get(last.dim(0).unwrap_or(0) - 1))
+        {
+            Ok(l) => l,
+            Err(e) => { gen_error = Some(e); break; }
+        };
 
-        let next_token = next_token_logits
-            .argmax(candle_core::D::Minus1)?
-            .to_scalar::<u32>()?;
+        let next_token = match next_token_logits
+            .argmax(candle_core::D::Minus1)
+            .and_then(|t| t.to_scalar::<u32>())
+        {
+            Ok(t) => t,
+            Err(e) => { gen_error = Some(e); break; }
+        };
 
         generated.push(next_token);
 
         let eos = tokenizer.token_to_id("<eos>").unwrap_or(0);
         if next_token == eos {
-            return Ok::<(), candle_core::Error>(());
+            break;
         }
-        Ok(())
-    });
+    }
 
-    if let Err(e) = gen_result {
+    if let Some(e) = gen_error {
         return AnalysisResponse { ok: false, errors: None, error: Some(format!("Inference error: {e}")) };
     }
 
@@ -179,7 +189,7 @@ fn analyze_code(code: String, state: State<AppState>) -> AnalysisResponse {
 }
 
 fn main() {
-    let app = tauri::Builder::default()
+    let _app = tauri::Builder::default()
         .manage(AppState {
             model: Mutex::new(None),
             tokenizer: Mutex::new(None),
@@ -205,8 +215,10 @@ fn main() {
             let device = Device::Cpu;
             let mut f = std::fs::File::open(&mp)
                 .map_err(|e| format!("Cannot open model: {e}"))?;
-            let model = candle_transformers::models::quantized_llama::Model::from_gguf(
-                &mut f, &device,
+            let content = candle_core::quantized::gguf_file::Content::read(&mut f)
+                .map_err(|e| format!("GGUF parse error: {e}"))?;
+            let model = candle_transformers::models::quantized_llama::ModelWeights::from_gguf(
+                content, &mut f, &device,
             )
             .map_err(|e| format!("GGUF load error: {e}"))?;
 
