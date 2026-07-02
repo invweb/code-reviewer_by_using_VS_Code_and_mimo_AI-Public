@@ -2,9 +2,12 @@
   "name": "code-reviewer",
   "version": "1.0.0",
   "scripts": {
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "dev": "npx serve src -l 1420 --no-clipboard",
+    "build": "npx serve src -l 1420 --no-clipboard"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2"
+    "@tauri-apps/cli": "^2",
+    "serve": "^14"
   }
 }
